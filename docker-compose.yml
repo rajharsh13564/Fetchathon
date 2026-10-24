@@ -1,0 +1,88 @@
+version: '3.8'
+
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - GEMINI_MODEL=${GEMINI_MODEL:-gemini-1.5-flash}
+      - FINPILOT_SYSTEM_PROMPT=${FINPILOT_SYSTEM_PROMPT}
+      - MARKET_DATA_CACHE_TTL=${MARKET_DATA_CACHE_TTL:-60}
+      - API_HOST=0.0.0.0
+      - API_PORT=8000
+      - FRONTEND_URL=http://localhost:5173
+    env_file:
+      - .env
+    volumes:
+      - ./logs:/app/logs
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "5173:5173"
+    environment:
+      - VITE_API_URL=http://localhost:8000
+    depends_on:
+      - backend
+
+  orchestrator:
+    build:
+      context: .
+      dockerfile: Dockerfile.agent
+    command: python -m agents.orchestrator.agent
+    environment:
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - GEMINI_MODEL=${GEMINI_MODEL:-gemini-1.5-flash}
+      - FINPILOT_SYSTEM_PROMPT=${FINPILOT_SYSTEM_PROMPT}
+      - ORCHESTRATOR_SEED=${ORCHESTRATOR_SEED}
+      - QUANT_SCREENER_ADDRESS=${QUANT_SCREENER_ADDRESS}
+      - RISK_MANAGER_ADDRESS=${RISK_MANAGER_ADDRESS}
+      - DEEP_RESEARCHER_ADDRESS=${DEEP_RESEARCHER_ADDRESS}
+    env_file:
+      - .env
+    depends_on:
+      - backend
+
+  quant-screener:
+    build:
+      context: .
+      dockerfile: Dockerfile.agent
+    command: python -m agents.quant_screener.agent
+    environment:
+      - QUANT_SCREENER_SEED=${QUANT_SCREENER_SEED}
+    env_file:
+      - .env
+
+  risk-manager:
+    build:
+      context: .
+      dockerfile: Dockerfile.agent
+    command: python -m agents.risk_manager.agent
+    environment:
+      - RISK_MANAGER_SEED=${RISK_MANAGER_SEED}
+    env_file:
+      - .env
+
+  deep-researcher:
+    build:
+      context: .
+      dockerfile: Dockerfile.agent
+    command: python -m agents.deep_researcher.agent
+    environment:
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - GEMINI_MODEL=${GEMINI_MODEL:-gemini-1.5-flash}
+      - FINPILOT_RESEARCH_PROMPT=${FINPILOT_RESEARCH_PROMPT}
+      - DEEP_RESEARCHER_SEED=${DEEP_RESEARCHER_SEED}
+    env_file:
+      - .env

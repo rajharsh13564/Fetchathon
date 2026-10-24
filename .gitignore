@@ -1,0 +1,54 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+venv/
+env/
+ENV/
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Test coverage
+htmlcov/
+.coverage
+.pytest_cache/
+
+# Build artifacts
+dist/
+build/
+*.egg-info/
+
+# Node modules (frontend)
+frontend/node_modules/
+frontend/dist/
+
+# Agentverse deployment artifacts
+deployment/agentverse/*.py
+deployment/agentverse/*.json
+
+# Data files
+data/
+*.csv
+*.json
+
+# Cache
+.cache/
