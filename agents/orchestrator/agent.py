@@ -28,6 +28,7 @@ from agents.orchestrator.schemas import (
     AgentCoordinationRequest,
     AgentCoordinationResponse,
 )
+from agents.risk_manager.schemas import RiskAnalysisRequest, RiskAnalysisResponse
 from services.portfolio_service import get_portfolio_service
 from services.gemini_client import get_gemini_client
 from services.report_service import get_report_service
@@ -304,13 +305,55 @@ async def send_to_agent(
         raise AgentCommunicationError(agent_address, str(e))
 
 
+async def _send_and_validate(
+    ctx: Context,
+    agent_name: str,
+    agent_address: str,
+    request: Model,
+    expected_response_type: type,
+    timeout: int = 30,
+    correlation_context: Optional[CorrelationContext] = None,
+) -> Optional[Model]:
+    """
+    Send a request to a downstream agent and validate the response.
+    Returns the validated response or None on failure.
+    """
+    if not agent_address:
+        logger.warning(f"{agent_name} address not configured")
+        return None
+
+    try:
+        response = await send_to_agent(ctx, agent_address, request, timeout=timeout)
+        if response is None:
+            logger.warning(f"{agent_name} returned no response")
+            return None
+        
+        # Validate response type
+        if not isinstance(response, expected_response_type):
+            logger.error(
+                f"{agent_name} returned unexpected type: "
+                f"expected {expected_response_type.__name__}, got {type(response).__name__}"
+            )
+            return None
+        
+        logger.info(f"{agent_name} responded successfully")
+        return response
+        
+    except AgentCommunicationError as e:
+        logger.error(f"{agent_name} communication error: {e}")
+        return None
+    except Exception as e:
+        logger.error(f"Unexpected error communicating with {agent_name}: {e}")
+        return None
+
+
 async def coordinate_agents(
     ctx: Context,
     request_type: str,
     payload: Dict[str, Any],
     correlation_context: CorrelationContext,
 ) -> AgentCoordinationResponse:
-    """Coordinate with downstream agents."""
+    """Coordinate with downstream agents via genuine inter-agent communication."""
     results = {}
     errors = {}
     completed = []
@@ -327,15 +370,35 @@ async def coordinate_agents(
             errors["portfolio_analysis"] = str(e)
             failed.append("portfolio_analysis")
 
-    # Screening - via QuantScreener agent or local
-    if request_type in ("screening", "full_analysis") and config.enable_agent_communication:
-        if config.quant_screener_address:
+    # Screening - via QuantScreener agent
+    if request_type in ("screening", "full_analysis"):
+        if config.enable_agent_communication and config.quant_screener_address:
             try:
                 screening_request = ScreeningRequest(**payload)
-                # Would send to agent here
-                # For now, run locally
+                response = await _send_and_validate(
+                    ctx=ctx,
+                    agent_name="quant_screener",
+                    agent_address=config.quant_screener_address,
+                    request=screening_request,
+                    expected_response_type=RankedShortlistResponse,
+                    timeout=30,
+                    correlation_context=correlation_context,
+                )
+                if response:
+                    results["screening"] = response.model_dump(mode="json")
+                    completed.append("screening")
+                else:
+                    errors["screening"] = "QuantScreener agent returned no valid response"
+                    failed.append("screening")
+            except Exception as e:
+                errors["screening"] = str(e)
+                failed.append("screening")
+        elif not config.enable_agent_communication:
+            # Fallback to local service when agent communication is disabled
+            try:
                 from services.screening_service import get_screening_service
                 screening_service = get_screening_service()
+                screening_request = ScreeningRequest(**payload)
                 result = await screening_service.run_screening(screening_request, correlation_context)
                 results["screening"] = result.model_dump(mode="json")
                 completed.append("screening")
@@ -344,24 +407,81 @@ async def coordinate_agents(
                 failed.append("screening")
 
     # Research - via DeepResearcher agent
-    if request_type in ("research", "full_analysis") and config.enable_agent_communication:
-        if config.deep_researcher_address:
+    if request_type in ("research", "full_analysis"):
+        if config.enable_agent_communication and config.deep_researcher_address:
             try:
                 research_request = ResearchRequest(**payload)
-                # Would send to agent here
-                # For now, run locally if gemini available
-                if gemini_client:
-                    from services.research_service import get_research_service
-                    research_service = get_research_service()
-                    result = await research_service.research_company(research_request, correlation_context)
-                    results["research"] = result.model_dump(mode="json")
+                response = await _send_and_validate(
+                    ctx=ctx,
+                    agent_name="deep_researcher",
+                    agent_address=config.deep_researcher_address,
+                    request=research_request,
+                    expected_response_type=AgenticThesisResponse,
+                    timeout=60,  # Research takes longer
+                    correlation_context=correlation_context,
+                )
+                if response:
+                    results["research"] = response.model_dump(mode="json")
                     completed.append("research")
                 else:
-                    errors["research"] = "Gemini not configured"
+                    errors["research"] = "DeepResearcher agent returned no valid response"
                     failed.append("research")
             except Exception as e:
                 errors["research"] = str(e)
                 failed.append("research")
+        elif not config.enable_agent_communication and gemini_client:
+            # Fallback to local service when agent communication is disabled
+            try:
+                from services.research_service import get_research_service
+                research_service = get_research_service()
+                research_request = ResearchRequest(**payload)
+                result = await research_service.research_company(research_request, correlation_context)
+                results["research"] = result.model_dump(mode="json")
+                completed.append("research")
+            except Exception as e:
+                errors["research"] = str(e)
+                failed.append("research")
+        elif not gemini_client:
+            errors["research"] = "Gemini not configured and no remote DeepResearcher available"
+            failed.append("research")
+
+    # Risk Analysis - via RiskManager agent
+    if request_type in ("risk_analysis", "full_analysis"):
+        if config.enable_agent_communication and config.risk_manager_address:
+            try:
+                risk_request = RiskAnalysisRequest(**payload)
+                response = await _send_and_validate(
+                    ctx=ctx,
+                    agent_name="risk_manager",
+                    agent_address=config.risk_manager_address,
+                    request=risk_request,
+                    expected_response_type=RiskAnalysisResponse,
+                    timeout=60,  # Risk analysis takes longer
+                    correlation_context=correlation_context,
+                )
+                if response:
+                    results["risk_analysis"] = response.model_dump(mode="json")
+                    completed.append("risk_analysis")
+                else:
+                    errors["risk_analysis"] = "RiskManager agent returned no valid response"
+                    failed.append("risk_analysis")
+            except Exception as e:
+                errors["risk_analysis"] = str(e)
+                failed.append("risk_analysis")
+        elif not config.enable_agent_communication:
+            # Fallback to local portfolio service for basic risk metrics
+            try:
+                portfolio_input = PortfolioInput(**payload)
+                # Use portfolio service which includes basic risk metrics
+                result = await portfolio_service.analyze_portfolio(portfolio_input, correlation_context)
+                results["risk_analysis"] = {
+                    "portfolio_snapshot": result.model_dump(mode="json"),
+                    "note": "Full risk analysis requires RiskManager agent"
+                }
+                completed.append("risk_analysis")
+            except Exception as e:
+                errors["risk_analysis"] = str(e)
+                failed.append("risk_analysis")
 
     return AgentCoordinationResponse(
         request_type=request_type,
@@ -432,6 +552,75 @@ async def handle_chat_request(ctx: Context, sender: str, msg: ChatRequest):
     elif classification["action"] == "screening" and classification["confidence"] > 0.6:
         response.message += "\n\n💡 For stock screening, please use the screening interface or specify criteria like: 'Find stocks with P/E under 15 and market cap over 10000 crores'"
 
+    elif classification["action"] == "research" and classification["confidence"] > 0.6:
+        # Try to extract ticker from message for research
+        import re
+        ticker_match = re.search(r'\b([A-Z]{2,10}(?:\.NS|\.BO)?)\b', msg.message.upper())
+        if ticker_match:
+            ticker = ticker_match.group(1)
+            if not (ticker.endswith(".NS") or ticker.endswith(".BO")):
+                ticker = f"{ticker}.NS"
+            
+            # Trigger research via coordinate_agents
+            try:
+                research_payload = {
+                    "ticker": ticker,
+                    "investment_horizon": "medium",
+                    "risk_profile": "moderate",
+                    "correlation_context": msg.correlation_context.model_dump(),
+                }
+                coordination = await coordinate_agents(
+                    ctx=ctx,
+                    request_type="research",
+                    payload=research_payload,
+                    correlation_context=msg.correlation_context,
+                )
+                if "research" in coordination.results:
+                    research_data = coordination.results["research"]
+                    response.message += f"\n\n📊 **Research for {ticker}:**\n"
+                    response.message += f"Bull: {research_data.get('bull_thesis', {}).get('content', 'N/A')[:200]}...\n"
+                    response.message += f"Bear: {research_data.get('bear_thesis', {}).get('content', 'N/A')[:200]}..."
+                    response.message_type = "research_report"
+                    response.metadata["research"] = research_data
+                elif coordination.errors.get("research"):
+                    response.message += f"\n\n⚠️ Research unavailable: {coordination.errors['research']}"
+            except Exception as e:
+                logger.error(f"Research coordination error: {e}")
+                response.message += f"\n\n⚠️ Research failed: {str(e)}"
+
+    elif classification["action"] == "risk_analysis" and classification["confidence"] > 0.6:
+        # Try to extract portfolio for risk analysis
+        portfolio = await extract_portfolio_from_text(msg.message)
+        if portfolio:
+            try:
+                risk_payload = {
+                    "portfolio": portfolio.model_dump(mode="json"),
+                    "include_historical": True,
+                    "lookback_days": 252,
+                    "correlation_context": msg.correlation_context.model_dump(),
+                }
+                coordination = await coordinate_agents(
+                    ctx=ctx,
+                    request_type="risk_analysis",
+                    payload=risk_payload,
+                    correlation_context=msg.correlation_context,
+                )
+                if "risk_analysis" in coordination.results:
+                    risk_data = coordination.results["risk_analysis"]
+                    response.message += f"\n\n⚠️ **Risk Analysis:**\n"
+                    if "overall_risk_score" in risk_data:
+                        response.message += f"Overall Risk Score: {risk_data['overall_risk_score']}/100 ({risk_data.get('risk_level', 'N/A')})\n"
+                    if "recommendations" in risk_data:
+                        for rec in risk_data["recommendations"][:3]:
+                            response.message += f"• {rec}\n"
+                    response.message_type = "risk_analysis"
+                    response.metadata["risk_analysis"] = risk_data
+                elif coordination.errors.get("risk_analysis"):
+                    response.message += f"\n\n⚠️ Risk analysis unavailable: {coordination.errors['risk_analysis']}"
+            except Exception as e:
+                logger.error(f"Risk coordination error: {e}")
+                response.message += f"\n\n⚠️ Risk analysis failed: {str(e)}"
+
     await ctx.send(sender, response)
 
 
@@ -455,50 +644,140 @@ async def handle_portfolio_analysis(ctx: Context, sender: str, msg: PortfolioInp
 
 @orchestrator_protocol.on_message(model=ScreeningRequest, replies=RankedShortlistResponse)
 async def handle_screening_request(ctx: Context, sender: str, msg: ScreeningRequest):
-    """Handle screening request."""
+    """Handle screening request - delegate to QuantScreener agent if available."""
     logger.info(f"Screening request from {sender}")
 
-    try:
-        from services.screening_service import get_screening_service
-        screening_service = get_screening_service()
-        result = await screening_service.run_screening(msg, msg.correlation_context)
-        await ctx.send(sender, result)
-    except Exception as e:
-        logger.error(f"Screening error: {e}")
-        error_resp = ErrorResponse(
-            error=str(e),
-            code="SCREENING_ERROR",
-            request_id=msg.correlation_context.request_id,
+    if config.enable_agent_communication and config.quant_screener_address:
+        # Delegate to QuantScreener agent
+        response = await _send_and_validate(
+            ctx=ctx,
+            agent_name="quant_screener",
+            agent_address=config.quant_screener_address,
+            request=msg,
+            expected_response_type=RankedShortlistResponse,
+            timeout=30,
+            correlation_context=msg.correlation_context,
         )
-        await ctx.send(sender, error_resp)
+        if response:
+            await ctx.send(sender, response)
+        else:
+            error_resp = ErrorResponse(
+                error="QuantScreener agent unavailable or returned invalid response",
+                code="QUANT_SCREENER_UNAVAILABLE",
+                request_id=msg.correlation_context.request_id,
+            )
+            await ctx.send(sender, error_resp)
+    else:
+        # Fallback to local service
+        try:
+            from services.screening_service import get_screening_service
+            screening_service = get_screening_service()
+            result = await screening_service.run_screening(msg, msg.correlation_context)
+            await ctx.send(sender, result)
+        except Exception as e:
+            logger.error(f"Screening error: {e}")
+            error_resp = ErrorResponse(
+                error=str(e),
+                code="SCREENING_ERROR",
+                request_id=msg.correlation_context.request_id,
+            )
+            await ctx.send(sender, error_resp)
 
 
 @orchestrator_protocol.on_message(model=ResearchRequest, replies=AgenticThesisResponse)
 async def handle_research_request(ctx: Context, sender: str, msg: ResearchRequest):
-    """Handle research request."""
+    """Handle research request - delegate to DeepResearcher agent if available."""
     logger.info(f"Research request from {sender} for {msg.ticker}")
 
-    try:
-        if not gemini_client:
-            raise ConfigurationError("Gemini API key not configured")
-
-        from services.research_service import get_research_service
-        research_service = get_research_service()
-        result = await research_service.research_company(msg, msg.correlation_context)
-        await ctx.send(sender, result)
-    except Exception as e:
-        logger.error(f"Research error: {e}")
-        error_resp = ErrorResponse(
-            error=str(e),
-            code="RESEARCH_ERROR",
-            request_id=msg.correlation_context.request_id,
+    if config.enable_agent_communication and config.deep_researcher_address:
+        # Delegate to DeepResearcher agent
+        response = await _send_and_validate(
+            ctx=ctx,
+            agent_name="deep_researcher",
+            agent_address=config.deep_researcher_address,
+            request=msg,
+            expected_response_type=AgenticThesisResponse,
+            timeout=60,
+            correlation_context=msg.correlation_context,
         )
-        await ctx.send(sender, error_resp)
+        if response:
+            await ctx.send(sender, response)
+        else:
+            error_resp = ErrorResponse(
+                error="DeepResearcher agent unavailable or returned invalid response",
+                code="DEEP_RESEARCHER_UNAVAILABLE",
+                request_id=msg.correlation_context.request_id,
+            )
+            await ctx.send(sender, error_resp)
+    else:
+        # Fallback to local service
+        try:
+            if not gemini_client:
+                raise ConfigurationError("Gemini API key not configured")
+
+            from services.research_service import get_research_service
+            research_service = get_research_service()
+            result = await research_service.research_company(msg, msg.correlation_context)
+            await ctx.send(sender, result)
+        except Exception as e:
+            logger.error(f"Research error: {e}")
+            error_resp = ErrorResponse(
+                error=str(e),
+                code="RESEARCH_ERROR",
+                request_id=msg.correlation_context.request_id,
+            )
+            await ctx.send(sender, error_resp)
 
 
-# ============================================================================
-# Startup/Shutdown
-# ============================================================================
+@orchestrator_protocol.on_message(model=RiskAnalysisRequest, replies=RiskAnalysisResponse)
+async def handle_risk_analysis_request(ctx: Context, sender: str, msg: RiskAnalysisRequest):
+    """Handle risk analysis request - delegate to RiskManager agent if available."""
+    logger.info(f"Risk analysis request from {sender} for {len(msg.portfolio.holdings)} holdings")
+
+    if config.enable_agent_communication and config.risk_manager_address:
+        # Delegate to RiskManager agent
+        response = await _send_and_validate(
+            ctx=ctx,
+            agent_name="risk_manager",
+            agent_address=config.risk_manager_address,
+            request=msg,
+            expected_response_type=RiskAnalysisResponse,
+            timeout=60,
+            correlation_context=msg.correlation_context,
+        )
+        if response:
+            await ctx.send(sender, response)
+        else:
+            error_resp = ErrorResponse(
+                error="RiskManager agent unavailable or returned invalid response",
+                code="RISK_MANAGER_UNAVAILABLE",
+                request_id=msg.correlation_context.request_id,
+            )
+            await ctx.send(sender, error_resp)
+    else:
+        # Fallback to local portfolio service for basic risk metrics
+        try:
+            portfolio_analysis = await portfolio_service.analyze_portfolio(msg.portfolio, msg.correlation_context)
+            # Return basic risk info wrapped in a compatible response
+            fallback_response = RiskAnalysisResponse(
+                portfolio_snapshot=portfolio_analysis,
+                concentration_risk=msg.portfolio.model_dump() if hasattr(msg.portfolio, 'model_dump') else {},
+                volatility_risk={"note": "Full risk analysis requires RiskManager agent"},
+                correlation_risk={"note": "Full risk analysis requires RiskManager agent"},
+                overall_risk_score=0.0,
+                risk_level="Unknown",
+                recommendations=["Configure RiskManager agent for full risk analysis"],
+                correlation_context=msg.correlation_context,
+            )
+            await ctx.send(sender, fallback_response)
+        except Exception as e:
+            logger.error(f"Risk analysis error: {e}")
+            error_resp = ErrorResponse(
+                error=str(e),
+                code="RISK_ANALYSIS_ERROR",
+                request_id=msg.correlation_context.request_id,
+            )
+            await ctx.send(sender, error_resp)
 
 @orchestrator.on_event("startup")
 async def startup(ctx: Context):

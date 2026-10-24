@@ -5,6 +5,7 @@ from schemas.screening import ScreeningRequest, RankedShortlistResponse
 from schemas.research import ResearchRequest, AgenticThesisResponse
 from schemas.chat import ChatRequest, ChatResponse
 from schemas.common import ErrorResponse
+from agents.risk_manager.schemas import RiskAnalysisRequest, RiskAnalysisResponse
 
 
 # Protocol names
@@ -41,6 +42,8 @@ ORCHESTRATOR_MESSAGES = {
     "screening_response": RankedShortlistResponse,
     "research_request": ResearchRequest,
     "research_response": AgenticThesisResponse,
+    "risk_analysis_request": RiskAnalysisRequest,
+    "risk_analysis_response": RiskAnalysisResponse,
     "error": ErrorResponse,
 }
 
@@ -51,8 +54,8 @@ QUANT_SCREENER_MESSAGES = {
 }
 
 RISK_MANAGER_MESSAGES = {
-    "risk_analysis_request": PortfolioInput,
-    "risk_analysis_response": PortfolioAnalysisResponse,  # Reuse portfolio response with risk focus
+    "risk_analysis_request": RiskAnalysisRequest,
+    "risk_analysis_response": RiskAnalysisResponse,
     "error": ErrorResponse,
 }
 
